@@ -73,6 +73,15 @@ export function setWater(wx, wy, wz, level) {
   waterLevels.get(chunkKey(cx, cz))[i] = level;
 }
 
+export function setAir(wx, wy, wz) {
+  if (wy < 0 || wy >= CHUNK_Y) return;
+  const cx = Math.floor(wx / CHUNK_X);
+  const cz = Math.floor(wz / CHUNK_Z);
+  const c = chunks.get(chunkKey(cx, cz));
+  if (!c) return;
+  c[blockIndex(wx - cx * CHUNK_X, wy, wz - cz * CHUNK_Z)] = BLOCK.AIR;
+}
+
 export function getWaterLevel(wx, wy, wz) {
   if (wy < 0 || wy >= CHUNK_Y) return 0;
   const cx = Math.floor(wx / CHUNK_X);

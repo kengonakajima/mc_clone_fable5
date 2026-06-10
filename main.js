@@ -1,8 +1,10 @@
-import { createProgram, createMeshVao, deleteMesh } from './gl.js';
+import { createProgram, createMeshVao, deleteMesh, createTextureArray } from './gl.js';
 import { VS, FS } from './shaders.js';
 import { cam, camViewMatrix, mat4Perspective, mat4Multiply } from './camera.js';
-import { CHUNK_X, CHUNK_Z, chunks, chunkKey, generateChunk, terrainHeight, waterLevels, getBlock, getWaterLevel, setWater } from './world.js';
+import { CHUNK_X, CHUNK_Z, chunks, chunkKey, generateChunk, terrainHeight, waterLevels, getBlock, getWaterLevel, setWater, setAir } from './world.js';
 import { buildChunkMesh } from './mesh.js';
+import { scheduleWaterNeighbors, tickWater, getSplashPoints } from './water.js';
+import { initParticles, updateParticles, drawParticles } from './particles.js';
 
 const canvas = document.getElementById('glcanvas');
 const gl = canvas.getContext('webgl2');
@@ -22,6 +24,26 @@ const prog = createProgram(gl, VS, FS);
 const uVP = gl.getUniformLocation(prog, 'uVP');
 const uOffset = gl.getUniformLocation(prog, 'uOffset');
 const uAlpha = gl.getUniformLocation(prog, 'uAlpha');
+const uTint = gl.getUniformLocation(prog, 'uTint');
+const uTime = gl.getUniformLocation(prog, 'uTime');
+const uWave = gl.getUniformLocation(prog, 'uWave');
+
+// テクスチャ読み込み (mesh.js の BLOCK_TEX レイヤ順)
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('texture load failed: ' + src));
+    img.src = src;
+  });
+}
+const TEX_FILES = ['grass_top', 'dirt_grass', 'dirt', 'greystone', 'sand', 'water'];
+const texImages = await Promise.all(TEX_FILES.map((n) => loadImage('textures/' + n + '.png')));
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, createTextureArray(gl, texImages, 128));
+gl.useProgram(prog);
+gl.uniform1i(gl.getUniformLocation(prog, 'uTex'), 0);
+initParticles(gl);
 
 // --- チャンク管理 ---
 const VIEW_RADIUS = 4;          // この半径内をメッシュ化して描画
@@ -75,12 +97,25 @@ function updateChunks() {
   }
 }
 
-// スポーン位置: 原点付近の地形の上
-cam.x = CHUNK_X / 2;
-cam.z = CHUNK_Z / 2;
-cam.y = terrainHeight(CHUNK_X / 2, CHUNK_Z / 2) + 20;
-cam.yaw = 0;
-cam.pitch = -0.35;
+// デバッグ用初期水源: 原点周辺で一番高い山頂に水源を1つ置く
+let peakX = 0, peakZ = 0, peakH = -1;
+for (let wx = -48; wx <= 64; wx++) {
+  for (let wz = -48; wz <= 64; wz++) {
+    const h = terrainHeight(wx, wz);
+    if (h > peakH) { peakH = h; peakX = wx; peakZ = wz; }
+  }
+}
+generateChunk(Math.floor(peakX / CHUNK_X), Math.floor(peakZ / CHUNK_Z));
+setWater(peakX, peakH + 1, peakZ, 0);
+scheduleWaterNeighbors(peakX, peakH + 1, peakZ);
+console.log(`初期水源: (${peakX}, ${peakH + 1}, ${peakZ})`);
+
+// スポーン位置: 山頂の水源が見える位置
+cam.x = peakX + 18;
+cam.z = peakZ + 18;
+cam.y = peakH + 14;
+cam.yaw = -Math.PI / 4;
+cam.pitch = -0.4;
 
 // --- 入力 ---
 const keys = {};
@@ -120,13 +155,32 @@ window.keys = keys;
 window.getBlock = getBlock;
 window.getWaterLevel = getWaterLevel;
 window.setWater = setWater;
-// メッシュを捨てて updateChunks に作り直させる
-window.remesh = (cx, cz) => {
-  const m = meshes.get(chunkKey(cx, cz));
+window.getSplashPoints = getSplashPoints;
+// メッシュをその場で作り直す (削除→再構築待ちだと穴が見えるため即時置き換え)
+function remeshChunk(cx, cz) {
+  const key = chunkKey(cx, cz);
+  const m = meshes.get(key);
   if (!m) return;
   deleteMesh(gl, m.opaque);
   deleteMesh(gl, m.water);
-  meshes.delete(chunkKey(cx, cz));
+  const built = buildChunkMesh(cx, cz);
+  meshes.set(key, {
+    cx, cz,
+    opaque: createMeshVao(gl, built.opaque),
+    water: createMeshVao(gl, built.water),
+  });
+}
+window.remesh = remeshChunk;
+// 水源を置く / 取り除く (デバッグ用。M4 で掘削設置 UI に置き換える)
+window.placeWater = (wx, wy, wz) => {
+  setWater(wx, wy, wz, 0);
+  scheduleWaterNeighbors(wx, wy, wz);
+  remeshChunk(Math.floor(wx / CHUNK_X), Math.floor(wz / CHUNK_Z));
+};
+window.removeWater = (wx, wy, wz) => {
+  setAir(wx, wy, wz);
+  scheduleWaterNeighbors(wx, wy, wz);
+  remeshChunk(Math.floor(wx / CHUNK_X), Math.floor(wz / CHUNK_Z));
 };
 
 // --- メインループ ---
@@ -134,6 +188,7 @@ let frames = 0;
 let lastFpsTime = performance.now();
 let fps = 0;
 let lastTime = performance.now();
+let waterAccum = 0;
 
 function frame(now) {
   const dt = Math.min((now - lastTime) / 1000, 0.1);
@@ -148,6 +203,17 @@ function frame(now) {
   moveCamera(dt);
   updateChunks();
 
+  // 水流: 250ms ごとに 1 tick
+  waterAccum += dt;
+  if (waterAccum >= 0.25) {
+    waterAccum = 0;
+    for (const key of tickWater()) {
+      const [cx, cz] = key.split(',').map(Number);
+      remeshChunk(cx, cz);
+    }
+  }
+  updateParticles(dt, getSplashPoints());
+
   gl.enable(gl.DEPTH_TEST);
   gl.enable(gl.CULL_FACE);
   gl.clearColor(0.55, 0.75, 0.95, 1.0);
@@ -158,8 +224,11 @@ function frame(now) {
 
   gl.useProgram(prog);
   gl.uniformMatrix4fv(uVP, false, vp);
+  gl.uniform1f(uTime, now * 0.001);
   // パス1: 不透明
   gl.uniform1f(uAlpha, 1.0);
+  gl.uniform3f(uTint, 1.0, 1.0, 1.0);
+  gl.uniform1f(uWave, 0.0);
   for (const mesh of meshes.values()) {
     if (mesh.opaque.vertexCount === 0) continue;
     gl.uniform3f(uOffset, mesh.cx * CHUNK_X, 0, mesh.cz * CHUNK_Z);
@@ -172,6 +241,8 @@ function frame(now) {
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.depthMask(false);
   gl.uniform1f(uAlpha, 0.6);
+  gl.uniform3f(uTint, 0.35, 0.55, 1.0); // 水を青くする
+  gl.uniform1f(uWave, 0.04);
   for (const mesh of meshes.values()) {
     if (mesh.water.vertexCount === 0) continue;
     gl.uniform3f(uOffset, mesh.cx * CHUNK_X, 0, mesh.cz * CHUNK_Z);
@@ -181,6 +252,9 @@ function frame(now) {
   gl.depthMask(true);
   gl.disable(gl.BLEND);
   gl.bindVertexArray(null);
+
+  // パス3: 水しぶき
+  drawParticles(gl, vp, canvas.height);
 
   hud.textContent = `fps: ${fps}\npos: ${cam.x.toFixed(1)}, ${cam.y.toFixed(1)}, ${cam.z.toFixed(1)}\nchunks: ${meshes.size}`;
 

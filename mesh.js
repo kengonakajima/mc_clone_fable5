@@ -1,12 +1,20 @@
 import { CHUNK_X, CHUNK_Y, CHUNK_Z, BLOCK, getBlock, getWaterLevel } from './world.js';
 
-const BLOCK_COLOR = {
-  [BLOCK.GRASS]: [0.35, 0.65, 0.25],
-  [BLOCK.DIRT]: [0.45, 0.32, 0.2],
-  [BLOCK.STONE]: [0.5, 0.5, 0.5],
-  [BLOCK.SAND]: [0.82, 0.76, 0.55],
-  [BLOCK.WATER]: [0.15, 0.35, 0.75],
+// テクスチャレイヤ (textures/ の読み込み順): 0=草上面 1=草側面 2=土 3=石 4=砂 5=水
+const BLOCK_TEX = {
+  [BLOCK.GRASS]: { top: 0, side: 1, bottom: 2 },
+  [BLOCK.DIRT]: { top: 2, side: 2, bottom: 2 },
+  [BLOCK.STONE]: { top: 3, side: 3, bottom: 3 },
+  [BLOCK.SAND]: { top: 4, side: 4, bottom: 4 },
+  [BLOCK.WATER]: { top: 5, side: 5, bottom: 5 },
 };
+
+function faceTexLayer(b, f) {
+  const t = BLOCK_TEX[b];
+  if (f.dir[1] === 1) return t.top;
+  if (f.dir[1] === -1) return t.bottom;
+  return t.side;
+}
 
 // --- ライトマップ ---
 // メッシュ化するチャンクの周囲 RPAD ブロック(=隣チャンク)を含む領域で計算する。
@@ -122,8 +130,9 @@ function faceAO(nx, ny, nz, f) {
 const AO_FACTOR = [1.0, 0.85, 0.7, 0.55];
 
 // --- 水面の高さ ---
-// 水位 (0=水源 .. 7=末端) → ブロック内の水面の高さ
+// 水位 (0=水源 .. 7=末端, 8=落水) → ブロック内の水面の高さ
 function levelToHeight(L) {
+  if (L === 8) return 1; // 落水は満杯
   return (8 - L) / 9;
 }
 
@@ -144,9 +153,11 @@ function cornerHeight(wx, y, wz, dx, dz) {
   return sum / count; // 自セルが水なので count >= 1
 }
 
+// light: 面の明度 (shade×ライト)、layer: テクスチャレイヤ
 // topH: 水面用。上端 (y+1) の頂点をコーナー高さ [dx*2+dz] に下げる (null なら立方体のまま)
 // ao: 4 頂点の遮蔽度 (null なら AO なし)。遮蔽度に応じて対角線を切り替える
-function pushFace(verts, x, y, z, f, r, g, b, topH, ao) {
+// flow: テクスチャスクロール速度 [fu, fv] (uv/秒)。null なら静止 (水は揺らぎ)
+function pushFace(verts, x, y, z, f, light, layer, topH, ao, flow) {
   const px = x + f.p[0], py = y + f.p[1], pz = z + f.p[2];
   const a = [px, py, pz];
   const q = [px + f.u[0], py + f.u[1], pz + f.u[2]];
@@ -159,10 +170,19 @@ function pushFace(verts, x, y, z, f, r, g, b, topH, ao) {
     const v = corners[i];
     let vy = v[1];
     if (topH && vy === y + 1) vy = y + topH[(v[0] - x) * 2 + (v[2] - z)];
-    const k = ao ? AO_FACTOR[ao[i]] : 1;
-    verts.push(v[0], vy, v[2], r * k, g * k, b * k);
+    const k = ao ? AO_FACTOR[ao[i]] * light : light;
+    // UV はブロックローカル座標から決める (上下面: xz, 側面: 水平方向と高さ)
+    let u, tv;
+    if (f.dir[1] !== 0) { u = v[0] - x; tv = v[2] - z; }
+    else if (f.dir[0] !== 0) { u = v[2] - z; tv = vy - y; }
+    else { u = v[0] - x; tv = vy - y; }
+    verts.push(v[0], vy, v[2], k, k, k, u, tv, layer,
+      flow ? flow[0] : 0, flow ? flow[1] : 0);
   }
 }
+
+const FLOW_SPEED = 0.5; // 流水上面のスクロール速度 (uv/秒)
+const FALL_SPEED = 1.5; // 落水側面のスクロール速度
 
 // チャンクの不透明/水メッシュを作る。頂点はチャンクローカル座標(描画時に uOffset で移動)
 export function buildChunkMesh(cx, cz) {
@@ -176,7 +196,6 @@ export function buildChunkMesh(cx, cz) {
       for (let y = 0; y < CHUNK_Y; y++) {
         const b = getBlock(x0 + x, y, z0 + z);
         if (b === BLOCK.AIR) continue;
-        const color = BLOCK_COLOR[b];
         if (b === BLOCK.WATER) {
           // 水は空気に接する面だけ描く。最上段の水は上端をコーナー高さに下げる
           let topH = null;
@@ -188,12 +207,27 @@ export function buildChunkMesh(cx, cz) {
               cornerHeight(x0 + x, y, z0 + z, 1, 1),
             ];
           }
+          // 上面の流れ: コーナー高さの勾配の下り方向 (uv+flow*t で模様が下りへ動く)
+          let flow = null;
+          if (topH) {
+            const gx = (topH[2] + topH[3] - topH[0] - topH[1]) / 2;
+            const gz = (topH[1] + topH[3] - topH[0] - topH[2]) / 2;
+            const m = Math.hypot(gx, gz);
+            if (m > 0.01) flow = [gx / m * FLOW_SPEED, gz / m * FLOW_SPEED];
+          }
+          const falling = getWaterLevel(x0 + x, y, z0 + z) === 8;
           for (const f of FACES) {
             const nb = getBlock(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2]);
             if (nb !== BLOCK.AIR) continue;
             const s = f.shade * faceLight(x, y, z, f);
-            pushFace(waterVerts, x, y, z, f,
-              color[0] * s, color[1] * s, color[2] * s, topH, null);
+            let fl = null;
+            if (f.dir[1] === 1) fl = flow;
+            else if (f.dir[1] === 0) {
+              // 側面: 落水は速く、流れている水もゆっくり下向きに流す
+              if (falling) fl = [0, FALL_SPEED];
+              else if (flow) fl = [0, FLOW_SPEED];
+            }
+            pushFace(waterVerts, x, y, z, f, s, faceTexLayer(b, f), topH, null, fl);
           }
           continue;
         }
@@ -202,8 +236,7 @@ export function buildChunkMesh(cx, cz) {
           if (nb !== BLOCK.AIR && nb !== BLOCK.WATER) continue;
           const s = f.shade * faceLight(x, y, z, f);
           const ao = faceAO(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2], f);
-          pushFace(verts, x, y, z, f,
-            color[0] * s, color[1] * s, color[2] * s, null, ao);
+          pushFace(verts, x, y, z, f, s, faceTexLayer(b, f), null, ao, null);
         }
       }
     }
