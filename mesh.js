@@ -8,6 +8,79 @@ const BLOCK_COLOR = {
   [BLOCK.WATER]: [0.15, 0.35, 0.75],
 };
 
+// --- ライトマップ ---
+// メッシュ化するチャンクの周囲 RPAD ブロック(=隣チャンク)を含む領域で計算する。
+// サンライト: 空気の列に上から 15。flood fill: 透明ブロックへ 1 ずつ減衰して伝播。
+const RPAD = 16;
+const RX = CHUNK_X + RPAD * 2;
+const RZ = CHUNK_Z + RPAD * 2;
+const RY = CHUNK_Y;
+const lightBuf = new Uint8Array(RX * RY * RZ);
+const colTop = new Int16Array(RX * RZ); // 各列の最上段の非空気ブロックの y
+
+function lightIndex(rx, y, rz) {
+  return (rx * RZ + rz) * RY + y;
+}
+
+function isTransparent(b) {
+  return b === BLOCK.AIR || b === BLOCK.WATER;
+}
+
+function computeRegionLight(x0, z0) {
+  lightBuf.fill(0);
+  // 1) サンライト: 上から空気の間レベル 15
+  for (let rx = 0; rx < RX; rx++) {
+    for (let rz = 0; rz < RZ; rz++) {
+      let y = RY - 1;
+      while (y >= 0 && getBlock(x0 - RPAD + rx, y, z0 - RPAD + rz) === BLOCK.AIR) {
+        lightBuf[lightIndex(rx, y, rz)] = 15;
+        y--;
+      }
+      colTop[rx * RZ + rz] = y;
+    }
+  }
+  // 2) 横や下に暗い透明ブロックが接しうるサンライト面を seed にして flood fill
+  const queue = [];
+  for (let rx = 1; rx < RX - 1; rx++) {
+    for (let rz = 1; rz < RZ - 1; rz++) {
+      const top = colTop[rx * RZ + rz];
+      const maxN = Math.max(
+        colTop[(rx - 1) * RZ + rz], colTop[(rx + 1) * RZ + rz],
+        colTop[rx * RZ + rz - 1], colTop[rx * RZ + rz + 1], top + 1);
+      for (let y = top + 1; y <= Math.min(maxN, RY - 1); y++) {
+        queue.push(lightIndex(rx, y, rz));
+      }
+    }
+  }
+  let head = 0;
+  while (head < queue.length) {
+    const idx = queue[head++];
+    const level = lightBuf[idx];
+    if (level <= 1) continue;
+    const y = idx % RY;
+    const t = (idx - y) / RY;
+    const rz = t % RZ;
+    const rx = (t - rz) / RZ;
+    for (const f of FACES) {
+      const nx = rx + f.dir[0], ny = y + f.dir[1], nz = rz + f.dir[2];
+      if (nx < 0 || nx >= RX || ny < 0 || ny >= RY || nz < 0 || nz >= RZ) continue;
+      const nidx = lightIndex(nx, ny, nz);
+      if (lightBuf[nidx] >= level - 1) continue;
+      if (!isTransparent(getBlock(x0 - RPAD + nx, ny, z0 - RPAD + nz))) continue;
+      lightBuf[nidx] = level - 1;
+      queue.push(nidx);
+    }
+  }
+}
+
+// 面が接する透明ブロックの光量 (0..15) → 明度係数
+function faceLight(x, y, z, f) {
+  const ny = y + f.dir[1];
+  if (ny < 0 || ny >= RY) return 1.0;
+  const L = lightBuf[lightIndex(x + RPAD + f.dir[0], ny, z + RPAD + f.dir[2])];
+  return 0.2 + 0.8 * (L / 15);
+}
+
 // p: 面の原点, u/v: 辺ベクトル (cross(u,v) = 外向き法線), shade: 面の向きによる明度
 const FACES = [
   { dir: [1, 0, 0], p: [1, 0, 1], u: [0, 0, -1], v: [0, 1, 0], shade: 0.8 },
@@ -38,6 +111,7 @@ export function buildChunkMesh(cx, cz) {
   const waterVerts = [];
   const x0 = cx * CHUNK_X;
   const z0 = cz * CHUNK_Z;
+  computeRegionLight(x0, z0);
   for (let x = 0; x < CHUNK_X; x++) {
     for (let z = 0; z < CHUNK_Z; z++) {
       for (let y = 0; y < CHUNK_Y; y++) {
@@ -50,16 +124,18 @@ export function buildChunkMesh(cx, cz) {
           for (const f of FACES) {
             const nb = getBlock(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2]);
             if (nb !== BLOCK.AIR) continue;
+            const s = f.shade * faceLight(x, y, z, f);
             pushFace(waterVerts, x, y, z, f,
-              color[0] * f.shade, color[1] * f.shade, color[2] * f.shade, dropTop);
+              color[0] * s, color[1] * s, color[2] * s, dropTop);
           }
           continue;
         }
         for (const f of FACES) {
           const nb = getBlock(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2]);
           if (nb !== BLOCK.AIR && nb !== BLOCK.WATER) continue;
+          const s = f.shade * faceLight(x, y, z, f);
           pushFace(verts, x, y, z, f,
-            color[0] * f.shade, color[1] * f.shade, color[2] * f.shade, false);
+            color[0] * s, color[1] * s, color[2] * s, false);
         }
       }
     }
