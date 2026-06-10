@@ -11,6 +11,9 @@ export const BLOCK = { AIR: 0, GRASS: 1, DIRT: 2, STONE: 3, SAND: 4, WATER: 5 };
 // "cx,cz" -> Uint8Array(CHUNK_X * CHUNK_Y * CHUNK_Z)
 export const chunks = new Map();
 
+// "cx,cz" -> Uint8Array(同サイズ)。水ブロックの水位 (0=水源 .. 7=末端)。水以外の場所の値は無意味
+export const waterLevels = new Map();
+
 export function chunkKey(cx, cz) {
   return cx + ',' + cz;
 }
@@ -46,6 +49,7 @@ export function generateChunk(cx, cz) {
     }
   }
   chunks.set(chunkKey(cx, cz), data);
+  waterLevels.set(chunkKey(cx, cz), new Uint8Array(CHUNK_X * CHUNK_Y * CHUNK_Z));
   return data;
 }
 
@@ -56,4 +60,24 @@ export function getBlock(wx, wy, wz) {
   const c = chunks.get(chunkKey(cx, cz));
   if (!c) return BLOCK.AIR;
   return c[blockIndex(wx - cx * CHUNK_X, wy, wz - cz * CHUNK_Z)];
+}
+
+export function setWater(wx, wy, wz, level) {
+  if (wy < 0 || wy >= CHUNK_Y) return;
+  const cx = Math.floor(wx / CHUNK_X);
+  const cz = Math.floor(wz / CHUNK_Z);
+  const c = chunks.get(chunkKey(cx, cz));
+  if (!c) return;
+  const i = blockIndex(wx - cx * CHUNK_X, wy, wz - cz * CHUNK_Z);
+  c[i] = BLOCK.WATER;
+  waterLevels.get(chunkKey(cx, cz))[i] = level;
+}
+
+export function getWaterLevel(wx, wy, wz) {
+  if (wy < 0 || wy >= CHUNK_Y) return 0;
+  const cx = Math.floor(wx / CHUNK_X);
+  const cz = Math.floor(wz / CHUNK_Z);
+  const lv = waterLevels.get(chunkKey(cx, cz));
+  if (!lv) return 0;
+  return lv[blockIndex(wx - cx * CHUNK_X, wy, wz - cz * CHUNK_Z)];
 }

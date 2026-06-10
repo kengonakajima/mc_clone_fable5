@@ -1,4 +1,4 @@
-import { CHUNK_X, CHUNK_Y, CHUNK_Z, BLOCK, getBlock } from './world.js';
+import { CHUNK_X, CHUNK_Y, CHUNK_Z, BLOCK, getBlock, getWaterLevel } from './world.js';
 
 const BLOCK_COLOR = {
   [BLOCK.GRASS]: [0.35, 0.65, 0.25],
@@ -121,9 +121,32 @@ function faceAO(nx, ny, nz, f) {
 
 const AO_FACTOR = [1.0, 0.85, 0.7, 0.55];
 
-// dropTop: ブロック上端 (y+1) の頂点を 1/8 下げる (水面用)
+// --- 水面の高さ ---
+// 水位 (0=水源 .. 7=末端) → ブロック内の水面の高さ
+function levelToHeight(L) {
+  return (8 - L) / 9;
+}
+
+// 水ブロック (wx,y,wz) の上面コーナー (dx,dz ∈ {0,1}) の高さ。
+// コーナーを共有する最大4セルのうち水であるものの高さを平均する。
+// セルの上も水なら満杯 (1.0)。隣り合う水ブロック同士は同じ4セルから
+// 計算するので必ず同じ高さになり、面が連続する。
+function cornerHeight(wx, y, wz, dx, dz) {
+  let sum = 0, count = 0;
+  for (const ox of [dx - 1, dx]) {
+    for (const oz of [dz - 1, dz]) {
+      if (getBlock(wx + ox, y, wz + oz) !== BLOCK.WATER) continue;
+      if (getBlock(wx + ox, y + 1, wz + oz) === BLOCK.WATER) return 1;
+      sum += levelToHeight(getWaterLevel(wx + ox, y, wz + oz));
+      count++;
+    }
+  }
+  return sum / count; // 自セルが水なので count >= 1
+}
+
+// topH: 水面用。上端 (y+1) の頂点をコーナー高さ [dx*2+dz] に下げる (null なら立方体のまま)
 // ao: 4 頂点の遮蔽度 (null なら AO なし)。遮蔽度に応じて対角線を切り替える
-function pushFace(verts, x, y, z, f, r, g, b, dropTop, ao) {
+function pushFace(verts, x, y, z, f, r, g, b, topH, ao) {
   const px = x + f.p[0], py = y + f.p[1], pz = z + f.p[2];
   const a = [px, py, pz];
   const q = [px + f.u[0], py + f.u[1], pz + f.u[2]];
@@ -135,7 +158,7 @@ function pushFace(verts, x, y, z, f, r, g, b, dropTop, ao) {
   for (const i of order) {
     const v = corners[i];
     let vy = v[1];
-    if (dropTop && vy === y + 1) vy -= 0.125;
+    if (topH && vy === y + 1) vy = y + topH[(v[0] - x) * 2 + (v[2] - z)];
     const k = ao ? AO_FACTOR[ao[i]] : 1;
     verts.push(v[0], vy, v[2], r * k, g * k, b * k);
   }
@@ -155,14 +178,22 @@ export function buildChunkMesh(cx, cz) {
         if (b === BLOCK.AIR) continue;
         const color = BLOCK_COLOR[b];
         if (b === BLOCK.WATER) {
-          // 水は空気に接する面だけ描く。最上段の水は上端を 1/8 下げる
-          const dropTop = getBlock(x0 + x, y + 1, z0 + z) !== BLOCK.WATER;
+          // 水は空気に接する面だけ描く。最上段の水は上端をコーナー高さに下げる
+          let topH = null;
+          if (getBlock(x0 + x, y + 1, z0 + z) !== BLOCK.WATER) {
+            topH = [
+              cornerHeight(x0 + x, y, z0 + z, 0, 0),
+              cornerHeight(x0 + x, y, z0 + z, 0, 1),
+              cornerHeight(x0 + x, y, z0 + z, 1, 0),
+              cornerHeight(x0 + x, y, z0 + z, 1, 1),
+            ];
+          }
           for (const f of FACES) {
             const nb = getBlock(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2]);
             if (nb !== BLOCK.AIR) continue;
             const s = f.shade * faceLight(x, y, z, f);
             pushFace(waterVerts, x, y, z, f,
-              color[0] * s, color[1] * s, color[2] * s, dropTop, null);
+              color[0] * s, color[1] * s, color[2] * s, topH, null);
           }
           continue;
         }
@@ -172,7 +203,7 @@ export function buildChunkMesh(cx, cz) {
           const s = f.shade * faceLight(x, y, z, f);
           const ao = faceAO(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2], f);
           pushFace(verts, x, y, z, f,
-            color[0] * s, color[1] * s, color[2] * s, false, ao);
+            color[0] * s, color[1] * s, color[2] * s, null, ao);
         }
       }
     }

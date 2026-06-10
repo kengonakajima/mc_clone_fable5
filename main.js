@@ -1,7 +1,7 @@
 import { createProgram, createMeshVao, deleteMesh } from './gl.js';
 import { VS, FS } from './shaders.js';
 import { cam, camViewMatrix, mat4Perspective, mat4Multiply } from './camera.js';
-import { CHUNK_X, CHUNK_Z, chunks, chunkKey, generateChunk, terrainHeight } from './world.js';
+import { CHUNK_X, CHUNK_Z, chunks, chunkKey, generateChunk, terrainHeight, waterLevels, getBlock, getWaterLevel, setWater } from './world.js';
 import { buildChunkMesh } from './mesh.js';
 
 const canvas = document.getElementById('glcanvas');
@@ -70,6 +70,7 @@ function updateChunks() {
     const [cx, cz] = key.split(',').map(Number);
     if (Math.max(Math.abs(cx - ccx), Math.abs(cz - ccz)) > VIEW_RADIUS + 2) {
       chunks.delete(key);
+      waterLevels.delete(key);
     }
   }
 }
@@ -116,6 +117,17 @@ window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; }
 // デバッグ用
 window.cam = cam;
 window.keys = keys;
+window.getBlock = getBlock;
+window.getWaterLevel = getWaterLevel;
+window.setWater = setWater;
+// メッシュを捨てて updateChunks に作り直させる
+window.remesh = (cx, cz) => {
+  const m = meshes.get(chunkKey(cx, cz));
+  if (!m) return;
+  deleteMesh(gl, m.opaque);
+  deleteMesh(gl, m.water);
+  meshes.delete(chunkKey(cx, cz));
+};
 
 // --- メインループ ---
 let frames = 0;
