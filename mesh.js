@@ -91,17 +91,53 @@ const FACES = [
   { dir: [0, 0, -1], p: [1, 0, 0], u: [-1, 0, 0], v: [0, 1, 0], shade: 0.65 },
 ];
 
+// --- AO ---
+function isSolid(wx, wy, wz) {
+  const b = getBlock(wx, wy, wz);
+  return (b !== BLOCK.AIR && b !== BLOCK.WATER) ? 1 : 0;
+}
+
+function vertexAO(side1, side2, corner) {
+  return side1 && side2 ? 3 : side1 + side2 + corner;
+}
+
+// 面の外側レイヤ (nx,ny,nz) で 4 頂点 [p, p+u, p+u+v, p+v] の遮蔽度 (0..3) を返す
+function faceAO(nx, ny, nz, f) {
+  const um = isSolid(nx - f.u[0], ny - f.u[1], nz - f.u[2]);
+  const up = isSolid(nx + f.u[0], ny + f.u[1], nz + f.u[2]);
+  const vm = isSolid(nx - f.v[0], ny - f.v[1], nz - f.v[2]);
+  const vp = isSolid(nx + f.v[0], ny + f.v[1], nz + f.v[2]);
+  const cmm = isSolid(nx - f.u[0] - f.v[0], ny - f.u[1] - f.v[1], nz - f.u[2] - f.v[2]);
+  const cpm = isSolid(nx + f.u[0] - f.v[0], ny + f.u[1] - f.v[1], nz + f.u[2] - f.v[2]);
+  const cpp = isSolid(nx + f.u[0] + f.v[0], ny + f.u[1] + f.v[1], nz + f.u[2] + f.v[2]);
+  const cmp = isSolid(nx - f.u[0] + f.v[0], ny - f.u[1] + f.v[1], nz - f.u[2] + f.v[2]);
+  return [
+    vertexAO(um, vm, cmm),
+    vertexAO(up, vm, cpm),
+    vertexAO(up, vp, cpp),
+    vertexAO(um, vp, cmp),
+  ];
+}
+
+const AO_FACTOR = [1.0, 0.85, 0.7, 0.55];
+
 // dropTop: ブロック上端 (y+1) の頂点を 1/8 下げる (水面用)
-function pushFace(verts, x, y, z, f, r, g, b, dropTop) {
+// ao: 4 頂点の遮蔽度 (null なら AO なし)。遮蔽度に応じて対角線を切り替える
+function pushFace(verts, x, y, z, f, r, g, b, dropTop, ao) {
   const px = x + f.p[0], py = y + f.p[1], pz = z + f.p[2];
   const a = [px, py, pz];
   const q = [px + f.u[0], py + f.u[1], pz + f.u[2]];
   const c = [q[0] + f.v[0], q[1] + f.v[1], q[2] + f.v[2]];
   const d = [px + f.v[0], py + f.v[1], pz + f.v[2]];
-  for (const v of [a, q, c, a, c, d]) {
+  const corners = [a, q, c, d];
+  let order = [0, 1, 2, 0, 2, 3];
+  if (ao && ao[0] + ao[2] > ao[1] + ao[3]) order = [1, 2, 3, 1, 3, 0];
+  for (const i of order) {
+    const v = corners[i];
     let vy = v[1];
     if (dropTop && vy === y + 1) vy -= 0.125;
-    verts.push(v[0], vy, v[2], r, g, b);
+    const k = ao ? AO_FACTOR[ao[i]] : 1;
+    verts.push(v[0], vy, v[2], r * k, g * k, b * k);
   }
 }
 
@@ -126,7 +162,7 @@ export function buildChunkMesh(cx, cz) {
             if (nb !== BLOCK.AIR) continue;
             const s = f.shade * faceLight(x, y, z, f);
             pushFace(waterVerts, x, y, z, f,
-              color[0] * s, color[1] * s, color[2] * s, dropTop);
+              color[0] * s, color[1] * s, color[2] * s, dropTop, null);
           }
           continue;
         }
@@ -134,8 +170,9 @@ export function buildChunkMesh(cx, cz) {
           const nb = getBlock(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2]);
           if (nb !== BLOCK.AIR && nb !== BLOCK.WATER) continue;
           const s = f.shade * faceLight(x, y, z, f);
+          const ao = faceAO(x0 + x + f.dir[0], y + f.dir[1], z0 + z + f.dir[2], f);
           pushFace(verts, x, y, z, f,
-            color[0] * s, color[1] * s, color[2] * s, false);
+            color[0] * s, color[1] * s, color[2] * s, false, ao);
         }
       }
     }
